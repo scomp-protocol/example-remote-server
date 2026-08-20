@@ -11,6 +11,8 @@ The [Model Context Protocol](https://modelcontextprotocol.io) enables seamless i
 
 - [Quick Start](#quick-start)
 - [MCP Features](#mcp-features)
+- [Load-test tools](#load-test-tools)
+- [Load-test deployment](#load-test-deployment)
 - [Development Setup](#development-setup)
 - [Project Structure](#project-structure)
 - [Documentation](#documentation)
@@ -53,6 +55,106 @@ This server implements the complete MCP specification:
 - **[Sampling](https://modelcontextprotocol.io/docs/concepts/sampling)**: LLM interaction capabilities
 - **[Elicitation](https://modelcontextprotocol.io/docs/concepts/elicitation)**: User input elicitation with various field types
 - **Transports**: Both Streamable HTTP (recommended) and SSE (legacy)
+
+## Load-test tools
+
+This fork adds one module, `src/modules/mcp/services/loadtest-tools.ts`, registered from
+`createMcpServer()`. Its tools exist to exercise a governing proxy in front of the server —
+argument-level policy, awkward return shapes, deterministic failures, transport-level chaos
+and server-side state.
+
+**Everything variable is deterministic.** No `Math.random` and no wall-clock value decides
+what a tool returns: variation is derived from `fnv1a(sessionId + ":" + cursor)`, where the
+cursor is that session's invocation count. Tools that vary accept an optional `cursor`
+argument that pins the seed, so any observed behavior can be replayed exactly without
+re-running a load test.
+
+| Tool | Behavior |
+| --- | --- |
+| `ping` | Tiny, fast, always succeeds |
+| `classify` | Echoes its arguments; schema covers a string enum, a number bounded 0..1, a boolean, a string array, and a nested object with optional enum and bounded-integer fields |
+| `chaos_text` | Deterministic text of `size` (`1kb`/`100kb`/`1mb`/`4mb`) after a `latency` bucket (`0ms`/`50ms`/`1s`/`10s`/`near_timeout` = 55s) |
+| `chaos_image` | Deterministic RGB-noise PNG of `size` (`tiny` 32px … `huge` 1024px, ~3MB), optionally `with_text` for a mixed text+image result |
+| `chaos_result` | `shape`: `empty` (no content blocks), `unicode` (emoji, RTL overrides, control characters including NUL, quote/backslash bait, JSON/script bait, combining marks, escaped lone-surrogate text), or `nested` to `depth` |
+| `chaos_fail` | `mode`: `tool_error` (`isError` result), `client_error` (JSON-RPC `-32602`, 400-shaped), `server_error` (`-32603`, 500-shaped), `intermittent` (fails when the cursor is a multiple of `every_n`, default 17) |
+| `deep_nest` | Accepts a five-level nested argument and returns a result nested to `depth` (0..32) |
+| `enormous_schema` | Declares 250 optional fields; echoes which were provided |
+| `bulk_op_00` … `bulk_op_39` | Filler tools that make `tools/list` large (67 tools, ~63KB) |
+| `vanishing` | Listed until its first call in a session, then absent from `tools/list` |
+| `mutating_schema` | Its schema alternates between listings, and the handler validates the current version — a client that lists then calls sees a mismatch |
+| `unauthorized` | Answered by middleware with HTTP 401 *after* authentication succeeded (`mode`: `always` or `every_n`) |
+| `close_connection` | Answered by middleware, which writes `bytes_first` bytes and destroys the socket |
+| `deterministic_sample` | Reports seed, cursor and derived samples, so reproducibility is directly observable |
+| `counter` | `{"op": "increment" \| "read"}`; state is scoped to one MCP session |
+| `render_image`, `oversized_text`, `always_fails`, `slow_echo` | Named single-purpose tools: a small PNG, >1MB of text, an `isError` result, and a 12-second sleep |
+
+State (counter, invocation cursor, vanished flag, schema version) is keyed by MCP session id
+and disposed when the session's server is cleaned up, so it persists across calls within a
+session and is shared with nothing else.
+
+`unauthorized` and `close_connection` cannot be expressed as tool results, so the module also
+exports `loadTestTransportChaos`, an Express middleware mounted on `POST /mcp` **after** the
+bearer-auth middleware — the 401 and the dropped socket happen only once real authentication
+has passed. Nothing in the server's auth was weakened to make them possible. On the legacy
+SSE endpoint, where that middleware is not mounted, both tools return a text result saying so.
+
+`scripts/test-loadtest-tools.sh` proves the whole path against a locally started server:
+dynamic client registration, PKCE (S256, 64-character verifier), authorization, token
+exchange, `initialize`, `tools/list`, and a `tools/call` exercising every behavior above. For
+determinism it asserts that two `deterministic_sample` calls pinned to the same cursor return
+identical seed, samples and derived word, that a different cursor differs, and that
+`chaos_text` pinned to the same cursor is identical by md5 of the returned text. It requires
+`jq` and `openssl`.
+
+```bash
+./scripts/test-loadtest-tools.sh                        # defaults to PORT=8090
+PORT=9100 ./scripts/test-loadtest-tools.sh
+RUN_NEAR_TIMEOUT=1 ./scripts/test-loadtest-tools.sh     # also exercises the 55s bucket
+```
+
+## Load-test deployment
+
+Single-command run on a VPS, with in-process auth and in-memory sessions:
+
+```bash
+npm ci && npm run build && AUTH_MODE=internal PORT=3232 BASE_URI=https://mcp.example.com NODE_ENV=production npm start
+```
+
+- `PORT` — port the Node process binds (all interfaces).
+- `BASE_URI` — the public HTTPS origin clients reach. It is what the server advertises in its
+  OAuth metadata and audience checks, so it must be the external URL, not `localhost`.
+- `AUTH_MODE=internal` keeps the demo OAuth server in the same process; no second service.
+
+**TLS terminates in front of this process.** The server speaks plain HTTP; run caddy or nginx
+as a reverse proxy that holds the certificate for `BASE_URI` and forwards to `PORT`. Do not
+expose the Node port directly — DCR and the token endpoint are unauthenticated by design in
+this demo server.
+
+Dependencies of that command, stated honestly: Node >= 20.16, and nothing else. Redis is
+optional; without `REDIS_URL` the server falls back to in-memory sessions, which means a
+single process only — sessions are lost on restart and cannot be shared across instances. For
+a multi-process load test, run `docker compose up -d redis` and add `REDIS_URL=redis://localhost:6379`.
+
+**Size the box for the big payloads.** A single `chaos_text` at `4mb` or `chaos_image` at
+`huge` exists transiently three to four times over — the generated buffer, its JSON-encoded
+copy, and the transport's copy on the way out — so budget roughly 12–16MB of transient heap
+per concurrent multi-MB call, on top of Node's baseline. Concurrency on those two sizes is the
+memory limit of this deployment, not CPU.
+
+### Known limitations
+
+Deliberate, so the fork stays shallow — not defects to fix here:
+
+- Session state lives in a module-level map keyed by session id. It is disposed with the
+  session's server, but a session abandoned without a clean close leaves its (tiny) entry
+  behind, and the map is otherwise unbounded.
+- The transport chaos middleware keys on the `Mcp-Session-Id` header and does not re-check
+  session ownership; the upstream handler does that a moment later. Requests with no session
+  header share one `"no-session"` bucket, which in practice only pre-initialize requests use.
+- `enormous_schema`'s 250 fields are decorative: the handler reports which were provided and
+  does not enforce their bounds.
+- The `bulk_op_*` filler tools exist to make `tools/list` large; the proof script calls only
+  a couple of them.
 
 ## Development Setup
 

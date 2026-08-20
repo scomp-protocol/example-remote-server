@@ -19,6 +19,7 @@ import { getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/
 import { ITokenValidator } from '../../interfaces/auth-validator.js';
 import { handleStreamableHTTP } from './handlers/shttp.js';
 import { handleMessage, handleSSEConnection } from './handlers/sse.js';
+import { loadTestTransportChaos } from './services/loadtest-tools.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -93,7 +94,9 @@ export class MCPModule {
 
     // MCP endpoints - Streamable HTTP transport (recommended)
     router.get('/mcp', cors(corsOptions), bearerAuth, securityHeaders, handleStreamableHTTP);
-    router.post('/mcp', cors(corsOptions), bearerAuth, securityHeaders, handleStreamableHTTP);
+    // loadTestTransportChaos sits after bearerAuth: the load-test tools that
+    // return 401 or drop the connection do so only once auth has succeeded.
+    router.post('/mcp', cors(corsOptions), bearerAuth, securityHeaders, loadTestTransportChaos, handleStreamableHTTP);
     router.delete('/mcp', cors(corsOptions), bearerAuth, securityHeaders, handleStreamableHTTP);
 
     // MCP endpoints - SSE transport (legacy)

@@ -20,8 +20,8 @@ function redisChannelForSession(sessionId: string): string {
 }
 
 export async function handleSSEConnection(req: Request, res: Response) {
-  const { server: mcpServer, cleanup: mcpCleanup }  = createMcpServer();
   const transport = new SSEServerTransport("/message", res);
+  const { server: mcpServer, cleanup: mcpCleanup }  = createMcpServer(transport.sessionId);
   logger.info('Received MCP SSE connection', {
     sessionId: transport.sessionId
   });
