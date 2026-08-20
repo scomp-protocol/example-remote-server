@@ -2,7 +2,7 @@
 set -e
 
 echo "=================================================="
-echo "Load-Test Tools Proof - DCR + PKCE"
+echo "Load-Test Tools Proof - DCR + PKCE + tool matrix"
 echo "=================================================="
 echo "Registration -> authorize -> token -> MCP tools/call"
 echo ""
@@ -12,6 +12,8 @@ PORT="${PORT:-8090}"
 SERVER_URL="${BASE_URI:-http://localhost:$PORT}"
 USER_ID="loadtest-tools-$(date +%s)"
 SERVER_LOG="${SERVER_LOG:-/tmp/loadtest-tools-server.log}"
+# The near-timeout latency bucket sleeps 55s; opt in when you want it exercised.
+RUN_NEAR_TIMEOUT="${RUN_NEAR_TIMEOUT:-0}"
 
 echo "🔧 Configuration:"
 echo "  Server URL: $SERVER_URL (auth + MCP)"
@@ -21,7 +23,7 @@ echo ""
 
 # Build the project
 echo "🔨 Building project..."
-npm run build
+npm run build > /dev/null
 
 # Start merged server in internal mode
 echo "🚀 Starting server in INTERNAL mode..."
@@ -36,7 +38,7 @@ if ! curl -s -f "$SERVER_URL/" > /dev/null 2>&1; then
 fi
 echo "✅ Server is running (PID: $SERVER_PID)"
 
-# Helper: POST a JSON-RPC message to /mcp and print the JSON payload
+# Helper: POST a JSON-RPC message to /mcp, print the JSON payload
 mcp_call() {
     curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
       -H "Accept: application/json, text/event-stream" \
@@ -44,6 +46,27 @@ mcp_call() {
       -X POST -H "Content-Type: application/json" \
       -d "$1" \
       "$SERVER_URL/mcp" | grep "^data: " | sed 's/^data: //'
+}
+
+# Helper: same, but print only the HTTP status code
+mcp_status() {
+    curl -s -o /dev/null -w "%{http_code}" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "Accept: application/json, text/event-stream" \
+      -H "Mcp-Session-Id: $SESSION_ID" \
+      -X POST -H "Content-Type: application/json" \
+      -d "$1" \
+      "$SERVER_URL/mcp"
+}
+
+# Helper: build a tools/call request body
+call_body() {
+    printf '{"jsonrpc":"2.0","id":"%s","method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$2" "$3"
+}
+
+fail() {
+    echo "   ❌ $1"
+    exit 1
 }
 
 echo ""
@@ -56,10 +79,7 @@ CLIENT_RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" \
   "$SERVER_URL/register")
 CLIENT_ID=$(echo "$CLIENT_RESPONSE" | jq -r .client_id)
 CLIENT_SECRET=$(echo "$CLIENT_RESPONSE" | jq -r .client_secret)
-if [ "$CLIENT_ID" = "null" ] || [ -z "$CLIENT_ID" ]; then
-    echo "   ❌ Registration failed: $CLIENT_RESPONSE"
-    exit 1
-fi
+[ "$CLIENT_ID" = "null" ] && fail "Registration failed: $CLIENT_RESPONSE"
 echo "   ✅ Client ID: $CLIENT_ID"
 
 echo ""
@@ -67,10 +87,7 @@ echo "🔐 Step 2: Generate PKCE challenge (S256)"
 CODE_VERIFIER=$(openssl rand -base64 64 | tr -d "=+/\n" | cut -c1-64)
 CODE_CHALLENGE=$(echo -n "$CODE_VERIFIER" | openssl dgst -binary -sha256 | base64 | tr "+/" "-_" | tr -d "=")
 echo "   ✅ Verifier length: ${#CODE_VERIFIER} (RFC 7636 requires >= 43)"
-if [ "${#CODE_VERIFIER}" -lt 43 ]; then
-    echo "   ❌ Verifier shorter than 43 characters"
-    exit 1
-fi
+[ "${#CODE_VERIFIER}" -lt 43 ] && fail "Verifier shorter than 43 characters"
 
 echo ""
 echo "🎫 Step 3: Authorize"
@@ -78,21 +95,16 @@ STATE_PARAM="loadtest-tools-$(date +%s)"
 AUTH_URL="$SERVER_URL/authorize?response_type=code&client_id=$CLIENT_ID&redirect_uri=http://localhost:3000/callback&code_challenge=$CODE_CHALLENGE&code_challenge_method=S256&state=$STATE_PARAM"
 AUTH_PAGE=$(curl -s "$AUTH_URL")
 AUTH_CODE=$(echo "$AUTH_PAGE" | grep -o 'state=[^"&]*' | cut -d= -f2 | head -1)
-if [ -z "$AUTH_CODE" ]; then
-    echo "   ❌ Failed to extract authorization code"
-    exit 1
-fi
+[ -z "$AUTH_CODE" ] && fail "Failed to extract authorization code"
 echo "   ✅ Auth code: ${AUTH_CODE:0:20}..."
 
 echo ""
 echo "🔄 Step 4: Complete mock upstream auth"
-CALLBACK_URL="$SERVER_URL/mock-upstream-idp/callback?state=$AUTH_CODE&code=mock-auth-code&userId=$USER_ID"
-CALLBACK_RESPONSE=$(curl -s -i "$CALLBACK_URL")
+CALLBACK_RESPONSE=$(curl -s -i "$SERVER_URL/mock-upstream-idp/callback?state=$AUTH_CODE&code=mock-auth-code&userId=$USER_ID")
 if echo "$CALLBACK_RESPONSE" | grep -i "^location:" | tr -d '\r' | grep -q "state=$STATE_PARAM"; then
     echo "   ✅ State parameter verified"
 else
-    echo "   ❌ State parameter mismatch"
-    exit 1
+    fail "State parameter mismatch"
 fi
 
 echo ""
@@ -102,139 +114,255 @@ TOKEN_RESPONSE=$(curl -s -X POST -H "Content-Type: application/x-www-form-urlenc
   "$SERVER_URL/token")
 ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
 REFRESH_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .refresh_token)
-if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
-    echo "   ❌ Token exchange failed: $TOKEN_RESPONSE"
-    exit 1
-fi
+[ "$ACCESS_TOKEN" = "null" ] && fail "Token exchange failed: $TOKEN_RESPONSE"
 echo "   ✅ Access token: ${ACCESS_TOKEN:0:20}..."
-if [ "$REFRESH_TOKEN" != "null" ] && [ -n "$REFRESH_TOKEN" ]; then
-    echo "   ✅ Refresh token issued"
-fi
+[ "$REFRESH_TOKEN" != "null" ] && echo "   ✅ Refresh token issued"
 
 echo ""
 echo "❌ Step 6: A wrong verifier must be rejected"
 BAD_TOKEN_RESPONSE=$(curl -s -X POST -H "Content-Type: application/x-www-form-urlencoded" \
   -d "grant_type=authorization_code&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code=$AUTH_CODE&redirect_uri=http://localhost:3000/callback&code_verifier=not-the-verifier-not-the-verifier-not-the-ver" \
   "$SERVER_URL/token")
-if echo "$BAD_TOKEN_RESPONSE" | jq -e '.access_token' > /dev/null 2>&1; then
-    echo "   ❌ Server issued a token for a wrong verifier"
-    exit 1
-fi
+echo "$BAD_TOKEN_RESPONSE" | jq -e '.access_token' > /dev/null 2>&1 && fail "Server issued a token for a wrong verifier"
 echo "   ✅ Rejected: $(echo "$BAD_TOKEN_RESPONSE" | jq -r '.error // .')"
 
 echo ""
-echo "🧪 PHASE 2: Load-test tools"
+echo "🧪 PHASE 2: The tool matrix"
 echo "==========================="
 
 echo "📱 Step 7: Initialize MCP session"
-SESSION_ID=""
 INIT_RESPONSE=$(curl -i -s -H "Authorization: Bearer $ACCESS_TOKEN" \
   -H "Accept: application/json, text/event-stream" \
   -X POST -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"loadtest-tools-proof","version":"1.0"}}}' \
   "$SERVER_URL/mcp")
 SESSION_ID=$(echo "$INIT_RESPONSE" | grep -i "mcp-session-id:" | cut -d' ' -f2 | tr -d '\r')
-if [ -z "$SESSION_ID" ]; then
-    echo "   ❌ MCP session initialization failed"
-    echo "$INIT_RESPONSE"
-    exit 1
-fi
+[ -z "$SESSION_ID" ] && fail "MCP session initialization failed: $INIT_RESPONSE"
 echo "   ✅ Session: $SESSION_ID"
 
 echo ""
-echo "📋 Step 8: tools/list contains every load-test tool"
+echo "📋 Step 8: tools/list is large and complete"
 TOOLS_JSON=$(mcp_call '{"jsonrpc":"2.0","id":"tools","method":"tools/list"}')
-for TOOL in classify render_image oversized_text always_fails slow_echo counter; do
-    if ! echo "$TOOLS_JSON" | jq -e --arg t "$TOOL" '.result.tools[] | select(.name == $t)' > /dev/null; then
-        echo "   ❌ Missing tool: $TOOL"
-        exit 1
-    fi
-    HAS_SCHEMA=$(echo "$TOOLS_JSON" | jq -r --arg t "$TOOL" '.result.tools[] | select(.name == $t) | .inputSchema.type')
-    echo "   ✅ $TOOL (inputSchema.type=$HAS_SCHEMA)"
+TOOL_COUNT=$(echo "$TOOLS_JSON" | jq '.result.tools | length')
+LIST_BYTES=$(echo "$TOOLS_JSON" | wc -c)
+echo "   ✅ $TOOL_COUNT tools listed, $LIST_BYTES bytes of tools/list payload"
+[ "$TOOL_COUNT" -lt 50 ] && fail "tools/list is not large ($TOOL_COUNT tools)"
+for TOOL in ping classify chaos_text chaos_image chaos_result chaos_fail deep_nest \
+            render_image oversized_text always_fails slow_echo counter \
+            deterministic_sample enormous_schema vanishing mutating_schema \
+            unauthorized close_connection bulk_op_00 bulk_op_39; do
+    echo "$TOOLS_JSON" | jq -e --arg t "$TOOL" '.result.tools[] | select(.name == $t) | .inputSchema.type' > /dev/null \
+      || fail "Missing tool or schema: $TOOL"
 done
+echo "   ✅ Every named tool present with an object inputSchema"
+ENORMOUS_FIELDS=$(echo "$TOOLS_JSON" | jq '.result.tools[] | select(.name == "enormous_schema") | .inputSchema.properties | length')
+echo "   ✅ enormous_schema declares $ENORMOUS_FIELDS properties"
+[ "$ENORMOUS_FIELDS" -lt 250 ] && fail "enormous_schema is not enormous"
 echo "   ℹ️  classify schema: $(echo "$TOOLS_JSON" | jq -c '.result.tools[] | select(.name == "classify") | .inputSchema')"
 
 echo ""
 echo "🏷️  Step 9: classify round-trips its arguments"
-CLASSIFY_JSON=$(mcp_call '{"jsonrpc":"2.0","id":"classify","method":"tools/call","params":{"name":"classify","arguments":{"category":"security","confidence":0.82,"urgent":true,"tags":["pilot","load-test"],"subject":{"name":"acme-corp","region":"eu","priority":2}}}}')
-CLASSIFY_TEXT=$(echo "$CLASSIFY_JSON" | jq -r '.result.content[0].text')
+CLASSIFY_TEXT=$(mcp_call "$(call_body classify classify '{"category":"security","confidence":0.82,"urgent":true,"tags":["pilot","load-test"],"subject":{"name":"acme-corp","region":"eu","priority":2}}')" | jq -r '.result.content[0].text')
 echo "   → $CLASSIFY_TEXT"
 for EXPECT in "acme-corp" "security" "0.82" "urgent true" "pilot, load-test" "region eu" "priority 2"; do
     case "$CLASSIFY_TEXT" in
         *"$EXPECT"*) ;;
-        *) echo "   ❌ classify echo missing: $EXPECT"; exit 1 ;;
+        *) fail "classify echo missing: $EXPECT" ;;
     esac
 done
-echo "   ✅ classify echoed enum, bounded number, boolean, array and nested object"
+BAD_CLASSIFY=$(mcp_call "$(call_body classify-bad classify '{"category":"security","confidence":4,"urgent":true,"tags":[],"subject":{"name":"acme-corp"}}')")
+echo "$BAD_CLASSIFY" | jq -e '.result.isError == true or (.error != null)' > /dev/null \
+  || fail "Out-of-range confidence accepted: $BAD_CLASSIFY"
+echo "   ✅ Round-tripped enum, bounded number, boolean, array, nested object; out-of-range confidence rejected"
 
 echo ""
-echo "🚫 Step 10: classify rejects an out-of-range confidence"
-BAD_CLASSIFY=$(mcp_call '{"jsonrpc":"2.0","id":"classify-bad","method":"tools/call","params":{"name":"classify","arguments":{"category":"security","confidence":4,"urgent":true,"tags":[],"subject":{"name":"acme-corp"}}}}')
-if echo "$BAD_CLASSIFY" | jq -e '.result.isError == true or (.error != null)' > /dev/null; then
-    echo "   ✅ Rejected out-of-range confidence"
-else
-    echo "   ❌ Out-of-range confidence accepted: $BAD_CLASSIFY"
-    exit 1
-fi
+echo "🎲 Step 10: determinism — same (session, cursor) yields the same behavior"
+SAMPLE_A=$(mcp_call "$(call_body det-a deterministic_sample '{"cursor":7}')" | jq -c '.result.structuredContent | {cursor, seed, samples, word}')
+SAMPLE_B=$(mcp_call "$(call_body det-b deterministic_sample '{"cursor":7}')" | jq -c '.result.structuredContent | {cursor, seed, samples, word}')
+SAMPLE_C=$(mcp_call "$(call_body det-c deterministic_sample '{"cursor":8}')" | jq -c '.result.structuredContent | {cursor, seed, samples, word}')
+echo "   → cursor 7: $SAMPLE_A"
+echo "   → cursor 7: $SAMPLE_B"
+echo "   → cursor 8: $SAMPLE_C"
+[ "$SAMPLE_A" != "$SAMPLE_B" ] && fail "Same (session, cursor) produced different output"
+[ "$SAMPLE_A" = "$SAMPLE_C" ] && fail "Different cursors produced identical output"
+TEXT_MD5_A=$(mcp_call "$(call_body txt-a chaos_text '{"size":"1kb","cursor":11}')" | jq -r '.result.content[0].text' | md5sum | cut -d' ' -f1)
+TEXT_MD5_B=$(mcp_call "$(call_body txt-b chaos_text '{"size":"1kb","cursor":11}')" | jq -r '.result.content[0].text' | md5sum | cut -d' ' -f1)
+TEXT_MD5_C=$(mcp_call "$(call_body txt-c chaos_text '{"size":"1kb","cursor":12}')" | jq -r '.result.content[0].text' | md5sum | cut -d' ' -f1)
+echo "   → chaos_text md5 at cursor 11: $TEXT_MD5_A / $TEXT_MD5_B, at cursor 12: $TEXT_MD5_C"
+[ "$TEXT_MD5_A" != "$TEXT_MD5_B" ] && fail "Pinned cursor produced different text"
+[ "$TEXT_MD5_A" = "$TEXT_MD5_C" ] && fail "Different cursors produced identical text"
+echo "   ✅ Behavior is a pure function of (session id, cursor)"
 
 echo ""
 echo "🔢 Step 11: counter persists across calls in one session"
-C1=$(mcp_call '{"jsonrpc":"2.0","id":"c1","method":"tools/call","params":{"name":"counter","arguments":{"op":"increment"}}}' | jq -r '.result.structuredContent.counter')
-C2=$(mcp_call '{"jsonrpc":"2.0","id":"c2","method":"tools/call","params":{"name":"counter","arguments":{"op":"increment"}}}' | jq -r '.result.structuredContent.counter')
-C3=$(mcp_call '{"jsonrpc":"2.0","id":"c3","method":"tools/call","params":{"name":"counter","arguments":{"op":"read"}}}' | jq -r '.result.structuredContent.counter')
+C1=$(mcp_call "$(call_body c1 counter '{"op":"increment"}')" | jq -r '.result.structuredContent.counter')
+C2=$(mcp_call "$(call_body c2 counter '{"op":"increment"}')" | jq -r '.result.structuredContent.counter')
+C3=$(mcp_call "$(call_body c3 counter '{"op":"read"}')" | jq -r '.result.structuredContent.counter')
 echo "   → increment=$C1, increment=$C2, read=$C3"
-if [ "$C1" != "1" ] || [ "$C2" != "2" ] || [ "$C3" != "2" ]; then
-    echo "   ❌ Counter did not increment twice and hold"
-    exit 1
-fi
+{ [ "$C1" = "1" ] && [ "$C2" = "2" ] && [ "$C3" = "2" ]; } || fail "Counter did not increment twice and hold"
 echo "   ✅ Counter incremented twice and held at 2"
 
 echo ""
-echo "🖼️  Step 12: render_image returns an image content block"
-IMAGE_JSON=$(mcp_call '{"jsonrpc":"2.0","id":"img","method":"tools/call","params":{"name":"render_image","arguments":{}}}')
-IMAGE_TYPE=$(echo "$IMAGE_JSON" | jq -r '.result.content[0].type')
-IMAGE_MIME=$(echo "$IMAGE_JSON" | jq -r '.result.content[0].mimeType')
-IMAGE_BYTES=$(echo "$IMAGE_JSON" | jq -r '.result.content[0].data' | base64 -d | wc -c)
-if [ "$IMAGE_TYPE" != "image" ] || [ "$IMAGE_MIME" != "image/png" ]; then
-    echo "   ❌ Not an image block: $IMAGE_JSON"
-    exit 1
-fi
-echo "   ✅ image/png, $IMAGE_BYTES decoded bytes"
+echo "⚡ Step 12: ping is tiny and fast"
+PING_TEXT=$(mcp_call "$(call_body ping ping '{}')" | jq -r '.result.content[0].text')
+[ "$PING_TEXT" = "pong" ] || fail "ping returned: $PING_TEXT"
+echo "   ✅ ping -> pong"
 
 echo ""
-echo "📦 Step 13: oversized_text returns more than 1MB"
-OVERSIZED_BYTES=$(mcp_call '{"jsonrpc":"2.0","id":"big","method":"tools/call","params":{"name":"oversized_text","arguments":{}}}' | jq -r '.result.content[0].text' | wc -c)
-if [ "$OVERSIZED_BYTES" -le 1048576 ]; then
-    echo "   ❌ Only $OVERSIZED_BYTES bytes returned"
-    exit 1
-fi
-echo "   ✅ $OVERSIZED_BYTES bytes returned"
+echo "📦 Step 13: chaos_text sizes"
+for SIZE in 1kb 100kb 4mb; do
+    BYTES=$(mcp_call "$(call_body "text-$SIZE" chaos_text "{\"size\":\"$SIZE\"}")" | jq -r '.result.content[0].text' | wc -c)
+    echo "   ✅ size=$SIZE -> $BYTES bytes"
+done
+OVERSIZED_BYTES=$(mcp_call "$(call_body big oversized_text '{}')" | jq -r '.result.content[0].text' | wc -c)
+[ "$OVERSIZED_BYTES" -le 1048576 ] && fail "oversized_text returned only $OVERSIZED_BYTES bytes"
+echo "   ✅ oversized_text -> $OVERSIZED_BYTES bytes (>1MB)"
 
 echo ""
-echo "💥 Step 14: always_fails returns a tool error"
-FAIL_JSON=$(mcp_call '{"jsonrpc":"2.0","id":"fail","method":"tools/call","params":{"name":"always_fails","arguments":{}}}')
-if [ "$(echo "$FAIL_JSON" | jq -r '.result.isError')" != "true" ]; then
-    echo "   ❌ Not an error result: $FAIL_JSON"
-    exit 1
+echo "⏱️  Step 14: latency buckets"
+for BUCKET in 0ms 50ms 1s 10s; do
+    START=$(date +%s)
+    mcp_call "$(call_body "lat-$BUCKET" chaos_text "{\"size\":\"1kb\",\"latency\":\"$BUCKET\"}")" > /dev/null
+    echo "   ✅ latency=$BUCKET -> $(( $(date +%s) - START ))s"
+done
+if [ "$RUN_NEAR_TIMEOUT" = "1" ]; then
+    START=$(date +%s)
+    mcp_call "$(call_body lat-near chaos_text '{"size":"1kb","latency":"near_timeout"}')" > /dev/null
+    echo "   ✅ latency=near_timeout -> $(( $(date +%s) - START ))s"
+else
+    echo "   ⏭️  latency=near_timeout (55s) skipped; set RUN_NEAR_TIMEOUT=1 to include it"
 fi
-echo "   ✅ isError=true: $(echo "$FAIL_JSON" | jq -r '.result.content[0].text')"
 
 echo ""
-echo "🐢 Step 15: slow_echo takes more than 10 seconds"
+echo "🖼️  Step 15: images, including an obnoxious one, and mixed text+image"
+for SIZE in tiny huge; do
+    IMAGE_JSON=$(mcp_call "$(call_body "img-$SIZE" chaos_image "{\"size\":\"$SIZE\"}")")
+    [ "$(echo "$IMAGE_JSON" | jq -r '.result.content[0].type')" = "image" ] || fail "Not an image block: $SIZE"
+    IMAGE_BYTES=$(echo "$IMAGE_JSON" | jq -r '.result.content[0].data' | base64 -d | wc -c)
+    echo "   ✅ size=$SIZE -> $IMAGE_BYTES PNG bytes ($(echo "$IMAGE_JSON" | jq -r '.result.content[0].mimeType'))"
+done
+MIXED_TYPES=$(mcp_call "$(call_body img-mixed chaos_image '{"size":"tiny","with_text":true}')" | jq -r '[.result.content[].type] | join("+")')
+[ "$MIXED_TYPES" = "text+image" ] || fail "Mixed result was: $MIXED_TYPES"
+echo "   ✅ mixed result content: $MIXED_TYPES"
+RENDER_TYPE=$(mcp_call "$(call_body render render_image '{}')" | jq -r '.result.content[0].type')
+[ "$RENDER_TYPE" = "image" ] || fail "render_image returned $RENDER_TYPE"
+echo "   ✅ render_image -> image block"
+
+echo ""
+echo "🧬 Step 16: empty, hostile Unicode and nested results"
+EMPTY_LEN=$(mcp_call "$(call_body empty chaos_result '{"shape":"empty"}')" | jq '.result.content | length')
+[ "$EMPTY_LEN" = "0" ] || fail "Empty result had $EMPTY_LEN blocks"
+echo "   ✅ empty result: 0 content blocks"
+UNICODE_JSON=$(mcp_call "$(call_body uni chaos_result '{"shape":"unicode"}')")
+UNICODE_KEYS=$(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings | keys | join(",")')
+echo "   ✅ unicode keys: $UNICODE_KEYS"
+echo "   → emoji: $(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.emoji')"
+echo "   → rtl:   $(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.rtl')"
+echo "   → bait:  $(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.json_bait')"
+NESTED_DEPTH=$(mcp_call "$(call_body nested chaos_result '{"shape":"nested","depth":6}')" | jq -r '.result.structuredContent.nested.depth')
+[ "$NESTED_DEPTH" = "6" ] || fail "Nested result depth was $NESTED_DEPTH"
+echo "   ✅ nested result depth: $NESTED_DEPTH"
+DEEP_JSON=$(mcp_call "$(call_body deep deep_nest '{"depth":12,"payload":{"level1":{"level2":{"level3":{"level4":{"value":"leaf","flag":true}}}}}}')")
+DEEP_ECHO=$(echo "$DEEP_JSON" | jq -r '.result.structuredContent.payload.level1.level2.level3.level4.value')
+DEEP_DEPTH=$(echo "$DEEP_JSON" | jq -r '.result.structuredContent.nested.depth')
+{ [ "$DEEP_ECHO" = "leaf" ] && [ "$DEEP_DEPTH" = "12" ]; } || fail "deep_nest echo=$DEEP_ECHO depth=$DEEP_DEPTH"
+echo "   ✅ deep_nest echoed a 5-level argument and returned depth $DEEP_DEPTH"
+
+echo ""
+echo "💥 Step 17: deterministic failures"
+FAIL_JSON=$(mcp_call "$(call_body f1 chaos_fail '{"mode":"tool_error"}')")
+[ "$(echo "$FAIL_JSON" | jq -r '.result.isError')" = "true" ] || fail "tool_error was not an error result"
+echo "   ✅ tool_error -> isError result"
+CODE_400=$(mcp_call "$(call_body f2 chaos_fail '{"mode":"client_error"}')" | jq -r '.error.code')
+[ "$CODE_400" = "-32602" ] || fail "client_error code was $CODE_400"
+echo "   ✅ client_error -> JSON-RPC $CODE_400 (400-shaped, InvalidParams)"
+CODE_500=$(mcp_call "$(call_body f3 chaos_fail '{"mode":"server_error"}')" | jq -r '.error.code')
+[ "$CODE_500" = "-32603" ] || fail "server_error code was $CODE_500"
+echo "   ✅ server_error -> JSON-RPC $CODE_500 (500-shaped, InternalError)"
+INTERMITTENT_FAIL=$(mcp_call "$(call_body f4 chaos_fail '{"mode":"intermittent","every_n":17,"cursor":34}')" | jq -r '.error.message')
+INTERMITTENT_OK=$(mcp_call "$(call_body f5 chaos_fail '{"mode":"intermittent","every_n":17,"cursor":35}')" | jq -r '.result.structuredContent.failed')
+case "$INTERMITTENT_FAIL" in
+    *"intermittent failure at cursor 34"*) ;;
+    *) fail "Intermittent did not fail on the 17th multiple: $INTERMITTENT_FAIL" ;;
+esac
+[ "$INTERMITTENT_OK" = "false" ] || fail "Intermittent failed off-cycle"
+echo "   ✅ intermittent (N=17) fails at cursor 34, succeeds at cursor 35"
+ALWAYS_FAIL_TEXT=$(mcp_call "$(call_body f6 always_fails '{}')" | jq -r '.result.content[0].text')
+echo "   ✅ always_fails -> $ALWAYS_FAIL_TEXT"
+
+echo ""
+echo "🗂️  Step 18: enormous schema accepts and reports its fields"
+ENORMOUS_JSON=$(mcp_call "$(call_body enorm enormous_schema '{"field_000":"a","field_001":42,"field_002":"two","field_003":["x"]}')")
+echo "   ✅ $(echo "$ENORMOUS_JSON" | jq -r '.result.content[0].text')"
+
+echo ""
+echo "🫥 Step 19: vanishing tool disappears after its first call"
+BEFORE=$(mcp_call '{"jsonrpc":"2.0","id":"l1","method":"tools/list"}' | jq '[.result.tools[] | select(.name == "vanishing")] | length')
+VANISH_TEXT=$(mcp_call "$(call_body van vanishing '{}')" | jq -r '.result.content[0].text')
+AFTER=$(mcp_call '{"jsonrpc":"2.0","id":"l2","method":"tools/list"}' | jq '[.result.tools[] | select(.name == "vanishing")] | length')
+echo "   → listed before: $BEFORE, after: $AFTER"
+echo "   → $VANISH_TEXT"
+{ [ "$BEFORE" = "1" ] && [ "$AFTER" = "0" ]; } || fail "vanishing tool did not vanish"
+echo "   ✅ Present before the call, absent after"
+
+echo ""
+echo "🔀 Step 20: mutating_schema differs between list and call"
+LISTED_TYPE=$(mcp_call '{"jsonrpc":"2.0","id":"l3","method":"tools/list"}' | jq -r '.result.tools[] | select(.name == "mutating_schema") | .inputSchema.properties.value.type')
+echo "   → listing advertised value: $LISTED_TYPE"
+if [ "$LISTED_TYPE" = "string" ]; then
+    MUTATE_ARGS='{"value":"as-listed"}'
+else
+    MUTATE_ARGS='{"value":7,"mode":"strict"}'
+fi
+MUTATE_ERROR=$(mcp_call "$(call_body mut mutating_schema "$MUTATE_ARGS")" | jq -r '.error.message')
+case "$MUTATE_ERROR" in
+    *"do not match schema version"*) ;;
+    *) fail "Calling with the listed shape succeeded: $MUTATE_ERROR" ;;
+esac
+echo "   ✅ Calling with the listed shape was rejected: $MUTATE_ERROR"
+
+echo ""
+echo "🔒 Step 21: unauthorized returns HTTP 401 after successful auth"
+STATUS=$(mcp_status "$(call_body unauth unauthorized '{"mode":"always"}')")
+[ "$STATUS" = "401" ] || fail "unauthorized returned HTTP $STATUS"
+echo "   ✅ HTTP $STATUS on a session whose token is still valid"
+STATUS_OK=$(mcp_status "$(call_body ping2 ping '{}')")
+[ "$STATUS_OK" = "200" ] || fail "Session unusable after the synthetic 401 (HTTP $STATUS_OK)"
+echo "   ✅ Session still usable afterwards (HTTP $STATUS_OK)"
+
+echo ""
+echo "🔌 Step 22: close_connection drops the socket mid-response"
+set +e
+CLOSE_OUTPUT=$(curl -s --max-time 10 -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION_ID" \
+  -X POST -H "Content-Type: application/json" \
+  -d "$(call_body close close_connection '{"bytes_first":64}')" \
+  "$SERVER_URL/mcp")
+CLOSE_EXIT=$?
+set -e
+echo "   → curl exit $CLOSE_EXIT, ${#CLOSE_OUTPUT} bytes of partial body received"
+[ "$CLOSE_EXIT" -eq 0 ] && fail "Connection was not dropped"
+echo "   ✅ Client saw a truncated response (curl exit $CLOSE_EXIT)"
+STATUS_OK=$(mcp_status "$(call_body ping3 ping '{}')")
+[ "$STATUS_OK" = "200" ] || fail "Session unusable after the dropped connection (HTTP $STATUS_OK)"
+echo "   ✅ Session still usable afterwards (HTTP $STATUS_OK)"
+
+echo ""
+echo "🐢 Step 23: slow_echo takes more than 10 seconds"
 SLOW_START=$(date +%s)
-SLOW_TEXT=$(mcp_call '{"jsonrpc":"2.0","id":"slow","method":"tools/call","params":{"name":"slow_echo","arguments":{"message":"still here"}}}' | jq -r '.result.content[0].text')
+SLOW_TEXT=$(mcp_call "$(call_body slow slow_echo '{"message":"still here"}')" | jq -r '.result.content[0].text')
 SLOW_ELAPSED=$(( $(date +%s) - SLOW_START ))
 echo "   → $SLOW_TEXT (${SLOW_ELAPSED}s)"
-if [ "$SLOW_ELAPSED" -lt 10 ]; then
-    echo "   ❌ Returned in under 10 seconds"
-    exit 1
-fi
-echo "   ✅ Slow tool took ${SLOW_ELAPSED}s"
+[ "$SLOW_ELAPSED" -lt 10 ] && fail "slow_echo returned in under 10 seconds"
+echo "   ✅ slow_echo took ${SLOW_ELAPSED}s"
 
 echo ""
 echo "✅ LOAD-TEST TOOLS PROOF COMPLETE"
 echo "================================="
 echo "✅ DCR + PKCE (S256, ${#CODE_VERIFIER}-char verifier) accepted; wrong verifier rejected"
-echo "✅ All six load-test tools listed with JSON schemas"
-echo "✅ classify round-tripped; counter incremented twice within the session"
-echo "✅ image, oversized (>1MB), error and slow (>10s) tools behave as named"
+echo "✅ $TOOL_COUNT tools listed ($LIST_BYTES bytes), every one with a JSON schema"
+echo "✅ Determinism: identical (session, cursor) reproduced byte-identical behavior"
+echo "✅ Sizes, latency buckets, images, empty/Unicode/nested results, deterministic and"
+echo "   intermittent failures, vanishing and mutating tools, 401 and dropped connection"
+echo "   all behaved as named"

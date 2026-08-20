@@ -110,7 +110,9 @@ interface McpServerWrapper {
   cleanup: () => void;
 }
 
-export const createMcpServer = (): McpServerWrapper => {
+export const createMcpServer = (
+  sessionId: string = "no-session"
+): McpServerWrapper => {
   const server = new Server(
     {
       name: "example-servers/feature-reference",
@@ -130,7 +132,7 @@ export const createMcpServer = (): McpServerWrapper => {
   const subscriptions: Set<string> = new Set();
 
   // Load-test tools; state held here is scoped to this server's session
-  const loadTestTools = createLoadTestTools();
+  const loadTestTools = createLoadTestTools(sessionId);
 
   // Set up update interval for subscribed resources
   const subsUpdateInterval = setInterval(() => {
@@ -497,7 +499,7 @@ export const createMcpServer = (): McpServerWrapper => {
         inputSchema: { type: "object", properties: {} },
         _meta: { ui: { resourceUri: HELLO_WORLD_APP_URI } },
       },
-      ...loadTestTools.tools,
+      ...loadTestTools.listTools(),
     ];
 
     return { tools };
@@ -842,6 +844,7 @@ export const createMcpServer = (): McpServerWrapper => {
   });
 
   const cleanup = async () => {
+    loadTestTools.dispose();
     if (subsUpdateInterval) clearInterval(subsUpdateInterval);
     if (logsUpdateInterval) clearInterval(logsUpdateInterval);
     if (stdErrUpdateInterval) clearInterval(stdErrUpdateInterval);
