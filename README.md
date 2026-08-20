@@ -11,6 +11,8 @@ The [Model Context Protocol](https://modelcontextprotocol.io) enables seamless i
 
 - [Quick Start](#quick-start)
 - [MCP Features](#mcp-features)
+- [Load-test tools](#load-test-tools)
+- [Load-test deployment](#load-test-deployment)
 - [Development Setup](#development-setup)
 - [Project Structure](#project-structure)
 - [Documentation](#documentation)
@@ -53,6 +55,57 @@ This server implements the complete MCP specification:
 - **[Sampling](https://modelcontextprotocol.io/docs/concepts/sampling)**: LLM interaction capabilities
 - **[Elicitation](https://modelcontextprotocol.io/docs/concepts/elicitation)**: User input elicitation with various field types
 - **Transports**: Both Streamable HTTP (recommended) and SSE (legacy)
+
+## Load-test tools
+
+This fork adds one module, `src/modules/mcp/services/loadtest-tools.ts`, registered from
+`createMcpServer()`. Its tools exist to exercise a governing proxy in front of the server —
+argument-level policy, chaotic returns, and server-side state:
+
+| Tool | Behavior |
+| --- | --- |
+| `classify` | Echoes its arguments; schema covers a string enum, a number bounded 0..1, a boolean, a string array, and a nested object with optional enum and bounded-integer fields |
+| `render_image` | Returns an `image` content block (a small PNG) |
+| `oversized_text` | Returns more than 1MB of generated text (`megabytes`, 1..8, default 1.5) |
+| `always_fails` | Returns a tool result with `isError: true` |
+| `slow_echo` | Sleeps 12 seconds, then echoes `message` |
+| `counter` | `{"op": "increment" \| "read"}`; state is scoped to one MCP session |
+
+Counter state lives in the per-session MCP server instance created by `createMcpServer()`, so
+it persists across calls within a session and is not shared between sessions or users.
+
+`scripts/test-loadtest-tools.sh` proves the whole path against a locally started server:
+dynamic client registration, PKCE (S256, 64-character verifier), authorization, token
+exchange, `initialize`, `tools/list`, and a `tools/call` per tool. It requires `jq` and
+`openssl`.
+
+```bash
+./scripts/test-loadtest-tools.sh          # defaults to PORT=8090
+PORT=9100 ./scripts/test-loadtest-tools.sh
+```
+
+## Load-test deployment
+
+Single-command run on a VPS, with in-process auth and in-memory sessions:
+
+```bash
+npm ci && npm run build && AUTH_MODE=internal PORT=3232 BASE_URI=https://mcp.example.com NODE_ENV=production npm start
+```
+
+- `PORT` — port the Node process binds (all interfaces).
+- `BASE_URI` — the public HTTPS origin clients reach. It is what the server advertises in its
+  OAuth metadata and audience checks, so it must be the external URL, not `localhost`.
+- `AUTH_MODE=internal` keeps the demo OAuth server in the same process; no second service.
+
+**TLS terminates in front of this process.** The server speaks plain HTTP; run caddy or nginx
+as a reverse proxy that holds the certificate for `BASE_URI` and forwards to `PORT`. Do not
+expose the Node port directly — DCR and the token endpoint are unauthenticated by design in
+this demo server.
+
+Dependencies of that command, stated honestly: Node >= 20.16, and nothing else. Redis is
+optional; without `REDIS_URL` the server falls back to in-memory sessions, which means a
+single process only — sessions are lost on restart and cannot be shared across instances. For
+a multi-process load test, run `docker compose up -d redis` and add `REDIS_URL=redis://localhost:6379`.
 
 ## Development Setup
 
