@@ -100,8 +100,10 @@ SSE endpoint, where that middleware is not mounted, both tools return a text res
 
 `scripts/test-loadtest-tools.sh` proves the whole path against a locally started server:
 dynamic client registration, PKCE (S256, 64-character verifier), authorization, token
-exchange, `initialize`, `tools/list`, and a `tools/call` exercising every behavior above,
-including that the same `(session, cursor)` reproduces byte-identical output. It requires
+exchange, `initialize`, `tools/list`, and a `tools/call` exercising every behavior above. For
+determinism it asserts that two `deterministic_sample` calls pinned to the same cursor return
+identical seed, samples and derived word, that a different cursor differs, and that
+`chaos_text` pinned to the same cursor is identical by md5 of the returned text. It requires
 `jq` and `openssl`.
 
 ```bash
@@ -132,6 +134,27 @@ Dependencies of that command, stated honestly: Node >= 20.16, and nothing else. 
 optional; without `REDIS_URL` the server falls back to in-memory sessions, which means a
 single process only — sessions are lost on restart and cannot be shared across instances. For
 a multi-process load test, run `docker compose up -d redis` and add `REDIS_URL=redis://localhost:6379`.
+
+**Size the box for the big payloads.** A single `chaos_text` at `4mb` or `chaos_image` at
+`huge` exists transiently three to four times over — the generated buffer, its JSON-encoded
+copy, and the transport's copy on the way out — so budget roughly 12–16MB of transient heap
+per concurrent multi-MB call, on top of Node's baseline. Concurrency on those two sizes is the
+memory limit of this deployment, not CPU.
+
+### Known limitations
+
+Deliberate, so the fork stays shallow — not defects to fix here:
+
+- Session state lives in a module-level map keyed by session id. It is disposed with the
+  session's server, but a session abandoned without a clean close leaves its (tiny) entry
+  behind, and the map is otherwise unbounded.
+- The transport chaos middleware keys on the `Mcp-Session-Id` header and does not re-check
+  session ownership; the upstream handler does that a moment later. Requests with no session
+  header share one `"no-session"` bucket, which in practice only pre-initialize requests use.
+- `enormous_schema`'s 250 fields are decorative: the handler reports which were provided and
+  does not enforce their bounds.
+- The `bulk_op_*` filler tools exist to make `tools/list` large; the proof script calls only
+  a couple of them.
 
 ## Development Setup
 

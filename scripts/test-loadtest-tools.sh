@@ -119,9 +119,15 @@ echo "   ✅ Access token: ${ACCESS_TOKEN:0:20}..."
 [ "$REFRESH_TOKEN" != "null" ] && echo "   ✅ Refresh token issued"
 
 echo ""
-echo "❌ Step 6: A wrong verifier must be rejected"
+echo "❌ Step 6: A wrong verifier must be rejected (fresh, unconsumed code)"
+STATE_PARAM_2="loadtest-tools-neg-$(date +%s)"
+AUTH_PAGE_2=$(curl -s "$SERVER_URL/authorize?response_type=code&client_id=$CLIENT_ID&redirect_uri=http://localhost:3000/callback&code_challenge=$CODE_CHALLENGE&code_challenge_method=S256&state=$STATE_PARAM_2")
+AUTH_CODE_2=$(echo "$AUTH_PAGE_2" | grep -o 'state=[^"&]*' | cut -d= -f2 | head -1)
+[ -z "$AUTH_CODE_2" ] && fail "Failed to obtain a second authorization code"
+curl -s -o /dev/null "$SERVER_URL/mock-upstream-idp/callback?state=$AUTH_CODE_2&code=mock-auth-code&userId=$USER_ID"
+echo "   ℹ️  Second authorization round completed; code is fresh"
 BAD_TOKEN_RESPONSE=$(curl -s -X POST -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=authorization_code&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code=$AUTH_CODE&redirect_uri=http://localhost:3000/callback&code_verifier=not-the-verifier-not-the-verifier-not-the-ver" \
+  -d "grant_type=authorization_code&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&code=$AUTH_CODE_2&redirect_uri=http://localhost:3000/callback&code_verifier=not-the-verifier-not-the-verifier-not-the-ver" \
   "$SERVER_URL/token")
 echo "$BAD_TOKEN_RESPONSE" | jq -e '.access_token' > /dev/null 2>&1 && fail "Server issued a token for a wrong verifier"
 echo "   ✅ Rejected: $(echo "$BAD_TOKEN_RESPONSE" | jq -r '.error // .')"
@@ -158,6 +164,9 @@ echo "   ✅ Every named tool present with an object inputSchema"
 ENORMOUS_FIELDS=$(echo "$TOOLS_JSON" | jq '.result.tools[] | select(.name == "enormous_schema") | .inputSchema.properties | length')
 echo "   ✅ enormous_schema declares $ENORMOUS_FIELDS properties"
 [ "$ENORMOUS_FIELDS" -lt 250 ] && fail "enormous_schema is not enormous"
+CHAOS_REQUIRED=$(echo "$TOOLS_JSON" | jq -c '.result.tools[] | select(.name == "chaos_text") | (.inputSchema.required // [])')
+[ "$CHAOS_REQUIRED" = "[]" ] || fail "Defaulted arguments are advertised as required: $CHAOS_REQUIRED"
+echo "   ✅ Defaulted arguments are advertised as optional (chaos_text required: $CHAOS_REQUIRED)"
 echo "   ℹ️  classify schema: $(echo "$TOOLS_JSON" | jq -c '.result.tools[] | select(.name == "classify") | .inputSchema')"
 
 echo ""
@@ -256,7 +265,12 @@ echo "   ✅ empty result: 0 content blocks"
 UNICODE_JSON=$(mcp_call "$(call_body uni chaos_result '{"shape":"unicode"}')")
 UNICODE_KEYS=$(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings | keys | join(",")')
 echo "   ✅ unicode keys: $UNICODE_KEYS"
-echo "   → emoji: $(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.emoji')"
+UNICODE_EMOJI=$(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.emoji')
+UNICODE_QUOTES=$(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.quotes')
+[ "$UNICODE_EMOJI" = "🙈🙉🙊 family: 👨‍👩‍👧‍👦 flag: 🇯🇵" ] || fail "emoji string came back altered: $UNICODE_EMOJI"
+[ "$UNICODE_QUOTES" = "she said \"hi\" and 'bye' and \`tick\` and \\backslash\\" ] || fail "quotes string came back altered: $UNICODE_QUOTES"
+echo "   ✅ emoji and quote/backslash strings round-tripped exactly"
+echo "   → emoji: $UNICODE_EMOJI"
 echo "   → rtl:   $(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.rtl')"
 echo "   → bait:  $(echo "$UNICODE_JSON" | jq -r '.result.structuredContent.strings.json_bait')"
 NESTED_DEPTH=$(mcp_call "$(call_body nested chaos_result '{"shape":"nested","depth":6}')" | jq -r '.result.structuredContent.nested.depth')
@@ -330,6 +344,34 @@ STATUS_OK=$(mcp_status "$(call_body ping2 ping '{}')")
 [ "$STATUS_OK" = "200" ] || fail "Session unusable after the synthetic 401 (HTTP $STATUS_OK)"
 echo "   ✅ Session still usable afterwards (HTTP $STATUS_OK)"
 
+INV_BEFORE=$(mcp_call "$(call_body inv-a deterministic_sample '{}')" | jq -r '.result.structuredContent.invocation')
+mcp_status "$(call_body unauth2 unauthorized '{"mode":"always"}')" > /dev/null
+INV_AFTER=$(mcp_call "$(call_body inv-b deterministic_sample '{}')" | jq -r '.result.structuredContent.invocation')
+echo "   → invocation $INV_BEFORE -> $INV_AFTER across one 401 and one sample call"
+[ "$((INV_AFTER - INV_BEFORE))" -eq 2 ] || fail "A 401 call advanced the invocation counter by $((INV_AFTER - INV_BEFORE - 1)), not 1"
+echo "   ✅ A middleware-answered call advances the invocation counter by exactly 1"
+
+echo ""
+echo "🔁 Step 21b: unauthorized every_n=3 fires on exactly every third call"
+N0=$(mcp_call "$(call_body inv-c deterministic_sample '{}')" | jq -r '.result.structuredContent.invocation')
+PATTERN=""
+EXPECTED=""
+for I in 1 2 3 4 5 6; do
+    STATUS=$(mcp_status "$(call_body "everyn-$I" unauthorized '{"mode":"every_n","every_n":3}')")
+    PATTERN="$PATTERN $STATUS"
+    if [ "$(( (N0 + I) % 3 ))" -eq 0 ]; then
+        EXPECTED="$EXPECTED 401"
+    else
+        EXPECTED="$EXPECTED 200"
+    fi
+done
+echo "   → invocations $((N0 + 1))..$((N0 + 6)) returned:$PATTERN"
+echo "   → expected (multiples of 3):$EXPECTED"
+[ "$PATTERN" = "$EXPECTED" ] || fail "every_n pattern mismatch"
+COUNT_401=$(echo "$PATTERN" | tr ' ' '\n' | grep -c 401)
+[ "$COUNT_401" -eq 2 ] || fail "Expected exactly two 401s in six calls, got $COUNT_401"
+echo "   ✅ 401 landed on exactly the 3rd and 6th multiples, 200 elsewhere"
+
 echo ""
 echo "🔌 Step 22: close_connection drops the socket mid-response"
 set +e
@@ -343,7 +385,8 @@ CLOSE_EXIT=$?
 set -e
 echo "   → curl exit $CLOSE_EXIT, ${#CLOSE_OUTPUT} bytes of partial body received"
 [ "$CLOSE_EXIT" -eq 0 ] && fail "Connection was not dropped"
-echo "   ✅ Client saw a truncated response (curl exit $CLOSE_EXIT)"
+[ "${#CLOSE_OUTPUT}" -lt 64 ] && fail "Partial body was ${#CLOSE_OUTPUT} bytes; the 64 requested bytes did not arrive"
+echo "   ✅ Client saw the 64 requested bytes, then a truncated response (curl exit $CLOSE_EXIT)"
 STATUS_OK=$(mcp_status "$(call_body ping3 ping '{}')")
 [ "$STATUS_OK" = "200" ] || fail "Session unusable after the dropped connection (HTTP $STATUS_OK)"
 echo "   ✅ Session still usable afterwards (HTTP $STATUS_OK)"
@@ -362,7 +405,7 @@ echo "✅ LOAD-TEST TOOLS PROOF COMPLETE"
 echo "================================="
 echo "✅ DCR + PKCE (S256, ${#CODE_VERIFIER}-char verifier) accepted; wrong verifier rejected"
 echo "✅ $TOOL_COUNT tools listed ($LIST_BYTES bytes), every one with a JSON schema"
-echo "✅ Determinism: identical (session, cursor) reproduced byte-identical behavior"
+echo "✅ Determinism: a pinned (session, cursor) reproduced identical seed, samples and text md5"
 echo "✅ Sizes, latency buckets, images, empty/Unicode/nested results, deterministic and"
 echo "   intermittent failures, vanishing and mutating tools, 401 and dropped connection"
 echo "   all behaved as named"

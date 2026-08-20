@@ -21,10 +21,13 @@ import { z } from "zod/v4";
 
 type ToolInput = Tool["inputSchema"];
 
-// Helper to convert Zod schema to JSON schema using Zod v4's native support
+// Helper to convert Zod schema to JSON schema using Zod v4's native support.
+// io: "input" matters here: these tools use .default(), and the output view
+// advertises defaulted arguments as required, so a validating proxy would
+// reject calls this server accepts.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const toJsonSchema = (schema: z.ZodType<any>): ToolInput => {
-  return z.toJSONSchema(schema) as ToolInput;
+  return z.toJSONSchema(schema, { io: "input" }) as ToolInput;
 };
 
 /* ------------------------------------------------------------------ *
@@ -999,19 +1002,31 @@ export const loadTestTransportChaos = (
     return;
   }
 
+  // Sessionless requests (no Mcp-Session-Id) share one bucket; the streamable
+  // HTTP transport only allows that before initialize, which carries no
+  // tools/call, so a real session never lands here.
   const sessionId = (req.headers["mcp-session-id"] as string) ?? "no-session";
   const state = stateFor(sessionId);
-  const invocation = ++state.invocations;
+  // Peek at the invocation this call would be. Only the path that ANSWERS the
+  // request commits it: when we fall through, handleCall does the increment,
+  // so an invocation is counted exactly once either way.
+  const invocation = state.invocations + 1;
   const toolName = body.params.name as string;
   const args = (body.params.arguments ?? {}) as Record<string, unknown>;
 
   if (toolName === LoadTestToolName.UNAUTHORIZED) {
     const mode = args.mode === "every_n" ? "every_n" : "always";
-    const everyN = typeof args.every_n === "number" ? args.every_n : 17;
+    const everyN =
+      typeof args.every_n === "number" &&
+      Number.isInteger(args.every_n) &&
+      args.every_n >= 1
+        ? args.every_n
+        : 17;
     if (mode === "every_n" && invocation % everyN !== 0) {
       next();
       return;
     }
+    state.invocations = invocation;
     res
       .status(401)
       .setHeader("WWW-Authenticate", 'Bearer error="invalid_token"');
@@ -1026,13 +1041,19 @@ export const loadTestTransportChaos = (
     return;
   }
 
-  // close_connection: headers, a partial body, then destroy the socket
+  // close_connection: headers, a partial body, then destroy the socket. The
+  // destroy has to wait for the write callback, or the buffered bytes are
+  // discarded and the client sees no body at all.
+  state.invocations = invocation;
   const bytesFirst =
-    typeof args.bytes_first === "number" ? Math.min(args.bytes_first, 4096) : 64;
+    typeof args.bytes_first === "number" && Number.isFinite(args.bytes_first)
+      ? Math.min(Math.max(Math.trunc(args.bytes_first), 0), 4096)
+      : 64;
   res.status(200);
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-store");
   res.flushHeaders();
-  res.write(`event: message\ndata: ${"x".repeat(bytesFirst)}`);
-  req.socket.destroy();
+  res.write(`event: message\ndata: ${"x".repeat(bytesFirst)}\n`, () => {
+    req.socket.destroy();
+  });
 };
