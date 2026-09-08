@@ -983,6 +983,21 @@ export const createLoadTestTools = (sessionId: string): LoadTestTools => {
  * ------------------------------------------------------------------ */
 
 /**
+ * Stable mode: the transport-level chaos stands down and the two tools answer
+ * as plain results, so a client that treats a broken transport as fatal can
+ * run the whole catalog to the end. Per link, by `?stable=1` on the endpoint
+ * (`POST /mcp?stable=1`), or for the whole process by `LOAD_STABLE=1`. Every
+ * tool-level behavior stays as it is.
+ */
+export const isStable = (req: Request): boolean => {
+  if (process.env.LOAD_STABLE === "1" || process.env.LOAD_STABLE === "true") {
+    return true;
+  }
+  const stable = req.query?.stable;
+  return stable === "1" || stable === "true";
+};
+
+/**
  * Answers the two tools that cannot be expressed as a tool result: a 401 issued
  * after authentication already succeeded, and a connection destroyed mid-
  * response. Every other request is passed straight through.
@@ -996,7 +1011,8 @@ export const loadTestTransportChaos = (
   if (
     !body ||
     body.method !== "tools/call" ||
-    !TRANSPORT_CHAOS_TOOLS.includes(body.params?.name)
+    !TRANSPORT_CHAOS_TOOLS.includes(body.params?.name) ||
+    isStable(req)
   ) {
     next();
     return;

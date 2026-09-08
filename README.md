@@ -98,6 +98,12 @@ bearer-auth middleware — the 401 and the dropped socket happen only once real 
 has passed. Nothing in the server's auth was weakened to make them possible. On the legacy
 SSE endpoint, where that middleware is not mounted, both tools return a text result saying so.
 
+**Stable mode.** A client that treats a broken transport as fatal cannot get through
+`unauthorized` and `close_connection`. Linking `POST /mcp?stable=1` instead of `/mcp` makes
+the transport middleware stand down for that link alone, and the two tools answer as plain
+text results; `LOAD_STABLE=1` does the same for the whole process. Every tool-level behavior
+(`chaos_*`, `vanishing`, `mutating_schema`, the errors, the sizes, the delays) stays as it is.
+
 `scripts/test-loadtest-tools.sh` proves the whole path against a locally started server:
 dynamic client registration, PKCE (S256, 64-character verifier), authorization, token
 exchange, `initialize`, `tools/list`, and a `tools/call` exercising every behavior above. For
